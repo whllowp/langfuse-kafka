@@ -118,3 +118,6 @@ web/test-results/*
 
 # Superset config
 .superset/
+
+# Queue-layer benchmark output
+packages/shared/scripts/results/

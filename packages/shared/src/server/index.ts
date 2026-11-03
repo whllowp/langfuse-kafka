@@ -134,6 +134,7 @@ export * from "./redis/s3SlowdownTracking";
 export * from "./redis/ingestionFailureTracking";
 export * from "./auth/types";
 export * from "./queues";
+export * from "./queueBackends";
 export * from "./notifications";
 export * from "./orderByToPrisma";
 export * from "./filterToPrisma";

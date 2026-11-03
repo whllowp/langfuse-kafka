@@ -84,6 +84,46 @@ services:
     networks:
       - default
 
+  # Single-node KRaft Kafka for the QUEUE_BACKEND=kafka ingestion path.
+  # INTERNAL listener serves containers on the compose network; host-run dev
+  # processes (web/worker via pnpm dev) use EXTERNAL on
+  # ${KAFKA_ADVERTISED_HOST:-localhost}:${KAFKA_HOST_PORT:-9094}, which is
+  # what LANGFUSE_KAFKA_BROKERS should point at.
+  kafka:
+    image: docker.io/apache/kafka:3.9.0
+    container_name: ${KAFKA_CONTAINER_NAME:-langfuse-kafka}
+    restart: always
+    environment:
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:-langfuse-dev-kafka-cluster}
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:9094,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://${KAFKA_ADVERTISED_HOST:-localhost}:${KAFKA_HOST_PORT:-9094}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Topics are created explicitly (ensureTopics); production posture is
+      # no auto-creation.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    ports:
+      - ${HOST_IP:-127.0.0.1}:${KAFKA_HOST_PORT:-9094}:9094
+    volumes:
+      - langfuse_kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: nc -z localhost 9094 || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - default
+
   postgres:
     image: docker.io/postgres:${POSTGRES_VERSION:-17}
     container_name: ${POSTGRES_CONTAINER_NAME:-langfuse-postgres}
@@ -110,6 +150,9 @@ services:
 volumes:
   langfuse_postgres_data:
     name: ${POSTGRES_VOLUME_NAME:-langfuse_postgres_data}
+    driver: local
+  langfuse_kafka_data:
+    name: ${KAFKA_VOLUME_NAME:-langfuse_kafka_data}
     driver: local
   langfuse_clickhouse_data:
     name: ${CLICKHOUSE_DATA_VOLUME_NAME:-langfuse_clickhouse_data}

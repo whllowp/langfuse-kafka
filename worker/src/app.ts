@@ -47,6 +47,8 @@ import {
   SecondaryEvalExecutionQueue,
   LLMAsJudgeExecutionQueue,
   CodeEvalExecutionQueue,
+  ensureTopics,
+  resolveQueueBackend,
 } from "@langfuse/shared/src/server";
 import { monitorProcessorTtl } from "@langfuse/shared/monitors/server";
 import { IN_APP_AGENT_RUN_MAX_DURATION_MS } from "@langfuse/shared/in-app-agent/server/tunables";
@@ -402,17 +404,47 @@ if (env.QUEUE_CONSUMER_OTEL_INGESTION_SECONDARY_QUEUE_IS_ENABLED === "true") {
 }
 
 if (env.QUEUE_CONSUMER_INGESTION_QUEUE_IS_ENABLED === "true") {
-  // Register workers for all ingestion queue shards
-  const shardNames = IngestionQueue.getShardNames();
-  shardNames.forEach((shardName) => {
-    WorkerManager.register(
-      shardName as QueueName,
-      ingestionQueueProcessorBuilder(true), // this might redirect to secondary queue
+  if (resolveQueueBackend(env.QUEUE_BACKEND_INGESTION) === "kafka") {
+    // Kafka backend: one consumer group replaces the shard fleet; partition
+    // count provides the parallelism. Topics are auto-created on first use
+    // (dev convenience; production pre-provisions them).
+    ensureTopics([QueueName.IngestionQueue]).catch((err) => {
+      logger.error("Failed to ensure Kafka ingestion topics", err);
+    });
+    // Total in-flight messages ≈ assigned partitions × per-partition lanes.
+    // With fewer partitions than the configured concurrency, per-partition
+    // key-affinity parallelism keeps the worker as concurrent as the
+    // BullMQ path (same-entity ordering preserved by the executor).
+    const ingestionConcurrency =
+      env.LANGFUSE_INGESTION_QUEUE_PROCESSING_CONCURRENCY;
+    const effectivePartitions = Math.min(
+      ingestionConcurrency,
+      env.LANGFUSE_KAFKA_TOPIC_PARTITIONS,
+    );
+    WorkerManager.registerEventConsumer(
+      QueueName.IngestionQueue,
+      ingestionQueueProcessorBuilder(true),
       {
-        concurrency: env.LANGFUSE_INGESTION_QUEUE_PROCESSING_CONCURRENCY,
+        partitionsConsumedConcurrently: ingestionConcurrency,
+        handlerConcurrencyPerPartition: Math.max(
+          1,
+          Math.ceil(ingestionConcurrency / effectivePartitions),
+        ),
       },
     );
-  });
+  } else {
+    // Register workers for all ingestion queue shards
+    const shardNames = IngestionQueue.getShardNames();
+    shardNames.forEach((shardName) => {
+      WorkerManager.register(
+        shardName as QueueName,
+        ingestionQueueProcessorBuilder(true), // this might redirect to secondary queue
+        {
+          concurrency: env.LANGFUSE_INGESTION_QUEUE_PROCESSING_CONCURRENCY,
+        },
+      );
+    });
+  }
 }
 
 if (env.QUEUE_CONSUMER_INGESTION_SECONDARY_QUEUE_IS_ENABLED === "true") {

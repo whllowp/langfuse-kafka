@@ -136,9 +136,10 @@ export const ingestionQueueProcessorBuilder = (
         }
       }
 
-      const s3Client = getS3EventStorageClient(
-        env.LANGFUSE_S3_EVENT_UPLOAD_BUCKET,
-      );
+      // Kafka inline mode: the event bodies ride the message; no S3 access
+      // at all. Elements were validated by the ingestion schema at API entry
+      // before the producer published them.
+      const inlineEvents = job.data.payload.data.inlineEvents;
 
       logger.debug(
         `Processing ingestion event ${
@@ -166,53 +167,70 @@ export const ingestionQueueProcessorBuilder = (
 
       let totalS3DownloadSizeBytes = 0;
 
-      if (shouldSkipS3List) {
-        // Direct file download - skip S3 list operation
-        const filePath = `${s3Prefix}${job.data.payload.data.fileKey}.json`;
-        eventFiles = [{ file: filePath, createdAt: new Date() }];
+      let firstS3WriteTime: Date;
 
-        const file = await s3Client.download(filePath);
-        const fileSize = file.length;
-
-        recordHistogram("langfuse.ingestion.s3_file_size_bytes", fileSize, {
-          skippedS3List: "true",
-        });
-        totalS3DownloadSizeBytes += fileSize;
-
-        const parsedFile = JSON.parse(file);
-        events.push(...(Array.isArray(parsedFile) ? parsedFile : [parsedFile]));
+      if (inlineEvents) {
+        events.push(...(inlineEvents as IngestionEventType[]));
+        // No S3 write happened; the producer-side timestamp is the closest
+        // equivalent of the first-file creation time used for merge ordering.
+        firstS3WriteTime = new Date(job.timestamp);
       } else {
-        eventFiles = await s3Client.listFiles(s3Prefix);
-        // Listings are ordered by key (client-supplied event ids), not by
-        // upload time. Sort so arrival order is upload order; score merges
-        // rely on that for same-timestamp re-sends.
-        eventFiles.sort(
-          (a, b) => a.createdAt.getTime() - b.createdAt.getTime(),
+        const s3Client = getS3EventStorageClient(
+          env.LANGFUSE_S3_EVENT_UPLOAD_BUCKET,
         );
 
-        // Process files in batches
-        // If a user has 5k events, this will likely take 100 seconds.
-        const downloadAndParseFile = async (fileRef: { file: string }) => {
-          const file = await s3Client.download(fileRef.file);
+        if (shouldSkipS3List) {
+          // Direct file download - skip S3 list operation
+          const filePath = `${s3Prefix}${job.data.payload.data.fileKey}.json`;
+          eventFiles = [{ file: filePath, createdAt: new Date() }];
+
+          const file = await s3Client.download(filePath);
           const fileSize = file.length;
 
           recordHistogram("langfuse.ingestion.s3_file_size_bytes", fileSize, {
-            skippedS3List: "false",
+            skippedS3List: "true",
           });
           totalS3DownloadSizeBytes += fileSize;
 
           const parsedFile = JSON.parse(file);
-          return Array.isArray(parsedFile) ? parsedFile : [parsedFile];
-        };
-
-        const S3_CONCURRENT_READS = env.LANGFUSE_S3_CONCURRENT_READS;
-        const batches = chunk(eventFiles, S3_CONCURRENT_READS);
-        for (const batch of batches) {
-          const batchEvents = await Promise.all(
-            batch.map(downloadAndParseFile),
+          events.push(
+            ...(Array.isArray(parsedFile) ? parsedFile : [parsedFile]),
           );
-          events.push(...batchEvents.flat());
+        } else {
+          eventFiles = await s3Client.listFiles(s3Prefix);
+          // Listings are ordered by key (client-supplied event ids), not by
+          // upload time. Sort so arrival order is upload order; score merges
+          // rely on that for same-timestamp re-sends.
+          eventFiles.sort(
+            (a, b) => a.createdAt.getTime() - b.createdAt.getTime(),
+          );
+
+          // Process files in batches
+          // If a user has 5k events, this will likely take 100 seconds.
+          const downloadAndParseFile = async (fileRef: { file: string }) => {
+            const file = await s3Client.download(fileRef.file);
+            const fileSize = file.length;
+
+            recordHistogram("langfuse.ingestion.s3_file_size_bytes", fileSize, {
+              skippedS3List: "false",
+            });
+            totalS3DownloadSizeBytes += fileSize;
+
+            const parsedFile = JSON.parse(file);
+            return Array.isArray(parsedFile) ? parsedFile : [parsedFile];
+          };
+
+          const S3_CONCURRENT_READS = env.LANGFUSE_S3_CONCURRENT_READS;
+          const batches = chunk(eventFiles, S3_CONCURRENT_READS);
+          for (const batch of batches) {
+            const batchEvents = await Promise.all(
+              batch.map(downloadAndParseFile),
+            );
+            events.push(...batchEvents.flat());
+          }
         }
+        // eventFiles is sorted by createdAt above.
+        firstS3WriteTime = eventFiles[0]?.createdAt ?? new Date();
       }
 
       recordDistribution(
@@ -231,9 +249,6 @@ export const ingestionQueueProcessorBuilder = (
         "langfuse.ingestion.s3_all_files_size_bytes",
         totalS3DownloadSizeBytes,
       );
-
-      // eventFiles is sorted by createdAt above.
-      const firstS3WriteTime = eventFiles[0]?.createdAt ?? new Date();
 
       if (events.length === 0) {
         logger.warn(

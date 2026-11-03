@@ -31,6 +31,12 @@ export const IngestionEvent = z.object({
     fileKey: z.string().optional(),
     skipS3List: z.boolean().optional(),
     forwardToEventsTable: z.boolean().optional(),
+    // Kafka inline mode: the event bodies ride the queue message instead of
+    // an S3 reference. Mutually exclusive with fileKey. Elements were
+    // validated against the ingestion event schema at API entry; the queue
+    // payload stays loose like the other fields to avoid re-validating large
+    // batches twice.
+    inlineEvents: z.array(z.unknown()).optional(),
     // Optional for rolling deploy compatibility with in-flight jobs created
     // before ingestion attribution was added to the queue payload.
     ingestionApiKey: z.string().optional(),

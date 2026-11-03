@@ -178,6 +178,31 @@ const EnvSchema = z.object({
     .positive()
     .default(5),
   LANGFUSE_SECONDARY_INGESTION_QUEUE_ENABLED_PROJECT_IDS: z.string().optional(),
+  // Kafka queue backend selection for the ingestion queue (see
+  // packages/shared/src/env.ts for the shared configuration block).
+  QUEUE_BACKEND: z.enum(["redis", "kafka"]).default("redis"),
+  QUEUE_BACKEND_INGESTION: z.enum(["redis", "kafka"]).optional(),
+  LANGFUSE_KAFKA_BROKERS: z
+    .string()
+    .optional()
+    .transform((s) =>
+      s
+        ? s
+            .split(",")
+            .map((broker) => broker.trim())
+            .filter(Boolean)
+        : undefined,
+    ),
+  LANGFUSE_KAFKA_TOPIC_PARTITIONS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(6),
+  LANGFUSE_KAFKA_SESSION_TIMEOUT_MS: z.coerce
+    .number()
+    .int()
+    .min(6_000)
+    .default(15_000),
   LANGFUSE_INGESTION_CLICKHOUSE_WRITE_BATCH_SIZE: z.coerce
     .number()
     .positive()

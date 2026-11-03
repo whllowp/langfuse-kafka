@@ -231,6 +231,66 @@ const EnvSchema = z.object({
     .number()
     .nonnegative()
     .default(5_000),
+  // Queue backend selection for event-stream queues. Per-queue overrides
+  // (e.g. QUEUE_BACKEND_INGESTION) take precedence over this global default.
+  // Control-plane queues (cron, delayed retries, locks, rate limits) always
+  // stay on Redis/BullMQ regardless of this setting.
+  QUEUE_BACKEND: z.enum(["redis", "kafka"]).default("redis"),
+  QUEUE_BACKEND_INGESTION: z.enum(["redis", "kafka"]).optional(),
+  // Comma-separated broker list, e.g. "localhost:9092".
+  LANGFUSE_KAFKA_BROKERS: z
+    .string()
+    .optional()
+    .transform((s) =>
+      s
+        ? s
+            .split(",")
+            .map((broker) => broker.trim())
+            .filter(Boolean)
+        : undefined,
+    ),
+  LANGFUSE_KAFKA_CLIENT_ID: z.string().default("langfuse"),
+  LANGFUSE_KAFKA_TOPIC_PREFIX: z.string().default("langfuse"),
+  // Partition count used when the backend auto-creates topics. Mirrors the
+  // parallelism a sharded BullMQ deployment would provide; partition counts
+  // of an existing topic are never modified.
+  LANGFUSE_KAFKA_TOPIC_PARTITIONS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(6),
+  LANGFUSE_KAFKA_TOPIC_REPLICATION_FACTOR: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(1),
+  // Producer tuning. gzip is codec-portable (lz4/zstd need native codecs);
+  // JSON event bodies compress ~5-10x. Note: kafkajs 2.x shapes batches from
+  // naturally overlapping produce calls and has no linger/delivery-timeout
+  // knobs, so acks=all comes from the idempotent producer and batching from
+  // per-request publishBatch granularity.
+  LANGFUSE_KAFKA_COMPRESSION: z.enum(["none", "gzip"]).default("gzip"),
+  // Event bodies at or below this size are inlined into the Kafka message
+  // value, removing the S3 write/read round-trip from the ingestion hot
+  // path. Larger bodies fall back to the S3 reference channel.
+  LANGFUSE_KAFKA_INLINE_MAX_BYTES: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(512 * 1024),
+  // Consumer tuning. Session timeout aligns with BullMQ's lockDuration
+  // magnitude: a processing hang triggers rebalance instead of per-job lock
+  // expiry.
+  LANGFUSE_KAFKA_SESSION_TIMEOUT_MS: z.coerce
+    .number()
+    .int()
+    .min(6_000)
+    .default(15_000),
+  LANGFUSE_KAFKA_MAX_CONSUME_ATTEMPTS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(6),
   LANGFUSE_DELETE_SKIP_PROJECT_IDS: z
     .string()
     .optional()

@@ -4,11 +4,13 @@ import {
   convertQueueNameToMetricName,
   contextWithLangfuseProps,
   createBullMQWorkerOptionsWithRedis,
+  KafkaEventConsumer,
   logger,
   QueueName,
   recordDistribution,
   recordIncrement,
   traceException,
+  type ConsumedMessage,
 } from "@langfuse/shared/src/server";
 import {
   markQueueJobActivity,
@@ -19,6 +21,7 @@ import { SHARDED_QUEUE_BASE_NAMES } from "./shardedQueueRegistry";
 
 export class WorkerManager {
   private static workers: { [key: string]: Worker } = {};
+  private static eventConsumers: { [key: string]: KafkaEventConsumer } = {};
 
   private static extractProjectId(job: Job): string | undefined {
     const data = job.data as {
@@ -109,10 +112,90 @@ export class WorkerManager {
     };
   }
 
+  /**
+   * Register a queue on the Kafka backend. The same processor runs behind
+   * either backend: Kafka messages are synthesized into BullMQ-shaped job
+   * objects, and the metric/health instrumentation of register() is mirrored
+   * here so dashboards and the stuck-consumption health check observe one
+   * shape regardless of backend.
+   */
+  public static registerEventConsumer(
+    queueName: QueueName,
+    processor: Processor,
+    options: {
+      partitionsConsumedConcurrently?: number;
+      handlerConcurrencyPerPartition?: number;
+    } = {},
+  ): void {
+    if (WorkerManager.eventConsumers[queueName]) {
+      logger.info(`Event consumer ${queueName} is already registered`);
+      return;
+    }
+
+    const wrapped = WorkerManager.metricWrapper(processor, queueName);
+
+    const consumer = new KafkaEventConsumer(queueName, options);
+    WorkerManager.eventConsumers[queueName] = consumer;
+
+    const { baseMetric, shardTag } = WorkerManager.resolveMetricInfo(queueName);
+
+    consumer
+      .subscribe(async (message: ConsumedMessage) => {
+        try {
+          await wrapped({
+            id: message.id,
+            name: message.name,
+            timestamp: message.timestamp.getTime(),
+            data: {
+              id: message.id,
+              timestamp: message.timestamp,
+              name: message.name,
+              payload: message.payload,
+            },
+          } as unknown as Job);
+          // Liveness signal for the ?failIfQueueConsumptionStuck=true health
+          // check, mirroring the BullMQ "completed" event.
+          markQueueJobActivity();
+          recordIncrement(baseMetric + ".rate", 1, {
+            type: "completed",
+            ...shardTag,
+          });
+        } catch (err) {
+          logger.error(
+            `Queue message ${message.name} with id ${message.id} in ${queueName} failed`,
+            err,
+          );
+          traceException(err);
+          recordIncrement(baseMetric + ".rate", 1, {
+            type: "failed",
+            ...shardTag,
+          });
+          throw err;
+        }
+      })
+      .then(() => {
+        markQueueWorkerRegistered();
+        logger.info(`${queueName} kafka consumer started`);
+      })
+      .catch((err) => {
+        logger.error(`Failed to start kafka consumer for ${queueName}`, err);
+        traceException(err);
+      });
+  }
+
+  public static getEventConsumer(
+    queueName: QueueName,
+  ): KafkaEventConsumer | undefined {
+    return WorkerManager.eventConsumers[queueName];
+  }
+
   public static async closeWorkers(): Promise<void> {
-    await Promise.all(
-      Object.values(WorkerManager.workers).map((worker) => worker.close()),
-    );
+    await Promise.all([
+      ...Object.values(WorkerManager.workers).map((worker) => worker.close()),
+      ...Object.values(WorkerManager.eventConsumers).map((consumer) =>
+        consumer.stop(),
+      ),
+    ]);
     logger.info("All workers have been closed.");
   }
 

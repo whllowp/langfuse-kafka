@@ -6,7 +6,17 @@
     "NEXT_PUBLIC_LANGFUSE_BLOB_EXPORT_CUTOFF",
     "NEXT_PUBLIC_LANGFUSE_BLOB_EXPORTER_CUTOFF",
     "NEXT_PUBLIC_LANGFUSE_ANALYTICS_EXPORTER_CUTOFF",
-    "CLICKHOUSE_BIN"
+    "CLICKHOUSE_BIN",
+    // Queue-backend selection and Kafka brokers, consumed by the
+    // queue-layer benchmark and by web/worker in QUEUE_BACKEND=kafka mode.
+    "QUEUE_BACKEND",
+    "QUEUE_BACKEND_INGESTION",
+    "LANGFUSE_KAFKA_BROKERS",
+    "LANGFUSE_KAFKA_TOPIC_PREFIX",
+    "LANGFUSE_KAFKA_TOPIC_PARTITIONS",
+    // Benchmark-only connection overrides.
+    "REDIS_CONNECTION_STRING",
+    "LANGFUSE_S3_EVENT_UPLOAD_BUCKET"
   ],
   "envMode": "loose",
   "tasks": {

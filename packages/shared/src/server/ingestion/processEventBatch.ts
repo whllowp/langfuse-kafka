@@ -21,7 +21,7 @@ import {
 } from "../instrumentation";
 import { logger } from "../logger";
 import { QueueJobs } from "../queues";
-import { IngestionQueue } from "../redis/ingestionQueue";
+import { getIngestionEventPublisher } from "../queueBackends";
 import { redis } from "../redis/redis";
 import {
   eventTypes,
@@ -276,6 +276,172 @@ export const processEventBatch = async (
   /********************
    * ASYNC PROCESSING *
    ********************/
+  const ingestionPublisher = getIngestionEventPublisher();
+
+  if (ingestionPublisher.backend === "kafka") {
+    //
+    // Kafka inline path: event bodies ride the message value, so the hot
+    // path performs no S3 PUT at all. Only oversized groups (above
+    // LANGFUSE_KAFKA_INLINE_MAX_BYTES) fall back to the S3 reference
+    // channel, where the consumer downloads by fileKey (skipS3List).
+    // Like the redis path, nothing is enqueued until every S3 upload of
+    // the batch has succeeded, and the whole API batch is published as one
+    // backend call.
+    //
+    const authCheckPayload = authCheck as {
+      validKey: true;
+      scope: {
+        projectId: string;
+        accessLevel: "project" | "scores";
+      };
+    };
+    const publishEntries: {
+      message: {
+        id: string;
+        timestamp: Date;
+        name: typeof QueueJobs.IngestionJob;
+        payload: unknown;
+      };
+      shardingKey: string;
+    }[] = [];
+    const overflowUploads: Promise<void>[] = [];
+    let overflowUploadErrored = false;
+
+    for (const id of Object.keys(sortedBatchByEventBodyId)) {
+      const eventData = sortedBatchByEventBodyId[id];
+      const shardingKey = `${authCheck.scope.projectId}-${eventData.eventBodyId}`;
+
+      const { isSampled, isSamplingConfigured } = isTraceIdInSample({
+        projectId: authCheck.scope.projectId,
+        event: eventData.data[0],
+      });
+
+      if (!isSampled) {
+        recordIncrement("langfuse.ingestion.sampling", eventData.data.length, {
+          projectId: authCheck.scope.projectId ?? "<not set>",
+          sampling_decision: "out",
+        });
+        continue;
+      }
+
+      if (isSamplingConfigured) {
+        recordIncrement("langfuse.ingestion.sampling", eventData.data.length, {
+          projectId: authCheck.scope.projectId ?? "<not set>",
+          sampling_decision: "in",
+        });
+      }
+
+      const jobPayloadData = {
+        type: eventData.type,
+        eventBodyId: eventData.eventBodyId,
+        forwardToEventsTable,
+        bucketPrefix: eventData.bucketPrefix,
+        ingestionApiKey: attribution.ingestionApiKey,
+        ingestionSdkName: attribution.ingestionSdkName,
+        ingestionSdkVersion: attribution.ingestionSdkVersion,
+      };
+
+      const inlinePayload = {
+        data: { ...jobPayloadData, inlineEvents: eventData.data },
+        authCheck: authCheckPayload,
+      };
+
+      if (
+        Buffer.byteLength(JSON.stringify(inlinePayload), "utf8") <=
+        env.LANGFUSE_KAFKA_INLINE_MAX_BYTES
+      ) {
+        recordIncrement(
+          "langfuse.ingestion.kafka_inline",
+          eventData.data.length,
+          {
+            decision: "inline",
+          },
+        );
+        publishEntries.push({
+          message: {
+            id: randomUUID(),
+            timestamp: new Date(),
+            name: QueueJobs.IngestionJob as const,
+            payload: inlinePayload,
+          },
+          shardingKey,
+        });
+        continue;
+      }
+
+      // Oversized group: store bodies in S3 and reference them by fileKey.
+      recordIncrement(
+        "langfuse.ingestion.kafka_inline",
+        eventData.data.length,
+        {
+          decision: "s3_overflow",
+        },
+      );
+      const bucketPath = `${eventData.bucketPrefix}${eventData.key}.json`;
+      overflowUploads.push(
+        getS3StorageServiceClient(env.LANGFUSE_S3_EVENT_UPLOAD_BUCKET)
+          .uploadJson(bucketPath, eventData.data)
+          .then(() => {
+            publishEntries.push({
+              message: {
+                id: randomUUID(),
+                timestamp: new Date(),
+                name: QueueJobs.IngestionJob as const,
+                payload: {
+                  data: {
+                    ...jobPayloadData,
+                    fileKey: eventData.key,
+                    skipS3List: true,
+                  },
+                  authCheck: authCheckPayload,
+                },
+              },
+              shardingKey,
+            });
+          })
+          .catch((error: unknown) => {
+            overflowUploadErrored = true;
+            if (isS3SlowDownError(error)) {
+              logger.warn(
+                "S3 SlowDown error during overflow upload, marking project for secondary queue",
+                {
+                  projectId: authCheck.scope.projectId,
+                  error,
+                },
+              );
+              markProjectS3Slowdown(authCheck.scope.projectId!).catch(() => {});
+              markProjectIngestFailure(authCheck.scope.projectId!, {
+                source: "process_event_batch",
+                reason: "s3_slowdown",
+              });
+            } else {
+              markProjectIngestFailure(authCheck.scope.projectId!, {
+                source: "process_event_batch",
+                reason: "s3_upload_error",
+              });
+            }
+            logger.error("Failed to upload overflow event to S3", { error });
+          }),
+      );
+    }
+
+    await Promise.all(overflowUploads);
+
+    if (overflowUploadErrored) {
+      throw new Error(
+        "Failed to upload events to blob storage, aborting event processing",
+      );
+    }
+
+    await ingestionPublisher.publishBatch(publishEntries);
+
+    return aggregateBatchResult(
+      [...validationErrors, ...authenticationErrors],
+      sortedBatch.map((event) => ({ id: event.id, result: event })),
+      authCheck.scope.projectId,
+    );
+  }
+
   let s3UploadErrored = false;
   await instrumentAsync({ name: "s3-upload-events" }, async () => {
     // S3 Event Upload is blocking, but non-failing.
@@ -343,7 +509,6 @@ export const processEventBatch = async (
     Object.keys(sortedBatchByEventBodyId).map(async (id) => {
       const eventData = sortedBatchByEventBodyId[id];
       const shardingKey = `${authCheck.scope.projectId}-${eventData.eventBodyId}`;
-      const queue = IngestionQueue.getInstance({ shardingKey });
 
       const isDatasetRunItemEvent = eventData.entityType === "dataset_run_item";
       const isObservationEvent = eventData.entityType === "observation";
@@ -377,37 +542,34 @@ export const processEventBatch = async (
         });
       }
 
-      return queue
-        ? queue.add(
-            QueueJobs.IngestionJob,
-            {
-              id: randomUUID(),
-              timestamp: new Date(),
-              name: QueueJobs.IngestionJob as const,
-              payload: {
-                data: {
-                  type: eventData.type,
-                  eventBodyId: eventData.eventBodyId,
-                  fileKey: eventData.key,
-                  skipS3List: shouldSkipS3List,
-                  forwardToEventsTable,
-                  bucketPrefix: eventData.bucketPrefix,
-                  ingestionApiKey: attribution.ingestionApiKey,
-                  ingestionSdkName: attribution.ingestionSdkName,
-                  ingestionSdkVersion: attribution.ingestionSdkVersion,
-                },
-                authCheck: authCheck as {
-                  validKey: true;
-                  scope: {
-                    projectId: string;
-                    accessLevel: "project" | "scores";
-                  };
-                },
-              },
+      return ingestionPublisher.publish(
+        {
+          id: randomUUID(),
+          timestamp: new Date(),
+          name: QueueJobs.IngestionJob as const,
+          payload: {
+            data: {
+              type: eventData.type,
+              eventBodyId: eventData.eventBodyId,
+              fileKey: eventData.key,
+              skipS3List: shouldSkipS3List,
+              forwardToEventsTable,
+              bucketPrefix: eventData.bucketPrefix,
+              ingestionApiKey: attribution.ingestionApiKey,
+              ingestionSdkName: attribution.ingestionSdkName,
+              ingestionSdkVersion: attribution.ingestionSdkVersion,
             },
-            { delay: getDelay(delay, source) },
-          )
-        : Promise.reject("Failed to instantiate ingestion queue");
+            authCheck: authCheck as {
+              validKey: true;
+              scope: {
+                projectId: string;
+                accessLevel: "project" | "scores";
+              };
+            },
+          },
+        },
+        { shardingKey, delayMs: getDelay(delay, source) },
+      );
     }),
   );
 

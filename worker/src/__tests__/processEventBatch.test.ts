@@ -6,10 +6,10 @@ import {
   UNKNOWN_INGESTION_SDK_VALUE,
 } from "../../../packages/shared/src/server/ingestion/ingestionAttribution";
 
-const { getQueueInstanceMock, queueAddMock, uploadJsonMock } = vi.hoisted(
+const { getQueueInstanceMock, queueAddBulkMock, uploadJsonMock } = vi.hoisted(
   () => ({
     getQueueInstanceMock: vi.fn(),
-    queueAddMock: vi.fn(),
+    queueAddBulkMock: vi.fn(),
     uploadJsonMock: vi.fn(),
   }),
 );
@@ -63,8 +63,8 @@ const createTraceCreateEvent = () => {
 describe("processEventBatch", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    getQueueInstanceMock.mockReturnValue({ add: queueAddMock });
-    queueAddMock.mockResolvedValue(undefined);
+    getQueueInstanceMock.mockReturnValue({ addBulk: queueAddBulkMock });
+    queueAddBulkMock.mockResolvedValue(undefined);
     uploadJsonMock.mockResolvedValue(undefined);
   });
 
@@ -118,8 +118,10 @@ describe("processEventBatch", () => {
       successes: [{ id: "event-id", status: 201 }],
       errors: [],
     });
-    expect(queueAddMock).toHaveBeenCalledTimes(1);
-    expect(queueAddMock.mock.calls[0][1].payload.data).toMatchObject({
+    expect(queueAddBulkMock).toHaveBeenCalledTimes(1);
+    expect(
+      queueAddBulkMock.mock.calls[0][0][0].data.payload.data,
+    ).toMatchObject({
       ingestionApiKey: "pk-lf-attributed",
       ingestionSdkName: "python",
       ingestionSdkVersion: "3.4.0",
@@ -141,7 +143,9 @@ describe("processEventBatch", () => {
       attribution: createUnknownSdkIngestionAttribution({ authCheck }),
     });
 
-    expect(queueAddMock.mock.calls[0][1].payload.data).toMatchObject({
+    expect(
+      queueAddBulkMock.mock.calls[0][0][0].data.payload.data,
+    ).toMatchObject({
       ingestionApiKey: "pk-lf-public",
       ingestionSdkName: UNKNOWN_INGESTION_SDK_VALUE,
       ingestionSdkVersion: UNKNOWN_INGESTION_SDK_VALUE,
