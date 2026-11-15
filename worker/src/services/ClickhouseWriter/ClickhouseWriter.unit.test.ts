@@ -31,6 +31,7 @@ vi.mock("../../env", async (importOriginal) => {
     ...original,
     env: {
       LANGFUSE_INGESTION_CLICKHOUSE_WRITE_BATCH_SIZE: 100,
+      LANGFUSE_INGESTION_CLICKHOUSE_WRITE_MAX_BATCH_SIZE: 1000,
       LANGFUSE_INGESTION_CLICKHOUSE_WRITE_INTERVAL_MS: 5000,
       LANGFUSE_INGESTION_CLICKHOUSE_MAX_ATTEMPTS: 3,
     },
@@ -244,17 +245,44 @@ describe("ClickhouseWriter", () => {
     expect(writer["queue"][TableName.Observations]).toHaveLength(0);
   });
 
-  it("should not flush when isIntervalFlushInProgress is true", async () => {
+  it("should flush other tables on interval ticks while one table's flush is in flight", async () => {
+    let resolveFirstInsert!: () => void;
+    const firstInsert = new Promise<void>((resolve) => {
+      resolveFirstInsert = resolve;
+    });
     const mockInsert = vi
       .spyOn(clickhouseClientMock, "insert")
+      .mockReturnValueOnce(firstInsert)
       .mockResolvedValue();
-    writer["isIntervalFlushInProgress"] = true;
-    writer.addToQueue(TableName.Traces, { id: "1", name: "test" });
+
+    // Traces has a flush in flight that hangs on its INSERT (backOff defers
+    // even the first attempt by a microtask).
+    for (let i = 0; i < writer.batchSize; i++) {
+      writer.addToQueue(TableName.Traces, { id: `a${i}`, name: "test" } as any);
+    }
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Scores is a low-traffic table whose rows must not wait for Traces.
+    writer.addToQueue(TableName.Scores, { id: "s1", name: "score" } as any);
+    writer.addToQueue(TableName.Scores, { id: "s2", name: "score" } as any);
 
     await vi.advanceTimersByTimeAsync(writer.writeInterval);
 
-    expect(mockInsert).not.toHaveBeenCalled();
-    expect(writer["queue"][TableName.Traces]).toHaveLength(1);
+    const insertCallsFor = (table: TableName) =>
+      mockInsert.mock.calls.filter((call) => call[0].table === table);
+
+    // Per-table single flight: the tick starts no second Traces INSERT...
+    expect(insertCallsFor(TableName.Traces)).toHaveLength(1);
+    // ...while the same tick flushes Scores.
+    expect(insertCallsFor(TableName.Scores)).toHaveLength(1);
+    expect(insertCallsFor(TableName.Scores)[0][0].values).toHaveLength(2);
+    expect(writer["queue"][TableName.Scores]).toHaveLength(0);
+
+    resolveFirstInsert();
+    await vi.advanceTimersByTimeAsync(writer.writeInterval);
+
+    expect(mockInsert).toHaveBeenCalledTimes(2);
+    expect(writer["queue"][TableName.Traces]).toHaveLength(0);
   });
 
   it("should set up interval correctly in start method", () => {
@@ -311,12 +339,140 @@ describe("ClickhouseWriter", () => {
     await Promise.all(writes);
     await vi.advanceTimersByTimeAsync(writer.writeInterval);
 
-    expect(mockInsert).toHaveBeenCalledTimes(
-      Math.ceil(concurrentWrites / writer.batchSize),
-    );
+    // The add that crosses batchSize starts the only flush. Every later
+    // trigger is skipped while it is in flight, so its drain loop writes the
+    // remaining 900 rows in a single maxBatchSize-capped INSERT. Stable only
+    // because flush() assigns the in-flight placeholder synchronously before
+    // its first await, while the adds above are still running.
+    expect(mockInsert).toHaveBeenCalledTimes(2);
+    expect(mockInsert.mock.calls[0][0].values).toHaveLength(100);
+    expect(mockInsert.mock.calls[1][0].values).toHaveLength(900);
     expect(writer["queue"][TableName.Traces].length).toBeLessThan(
       writer.batchSize,
     );
+  });
+
+  it("should not trigger a second INSERT for a table with a flush in flight", async () => {
+    let resolveFirstInsert!: () => void;
+    const firstInsert = new Promise<void>((resolve) => {
+      resolveFirstInsert = resolve;
+    });
+    const mockInsert = vi
+      .spyOn(clickhouseClientMock, "insert")
+      .mockReturnValueOnce(firstInsert)
+      .mockResolvedValueOnce();
+
+    for (let i = 0; i < writer.batchSize; i++) {
+      writer.addToQueue(TableName.Traces, { id: `a${i}`, name: "test" } as any);
+    }
+
+    // Let the triggered flush reach its INSERT: backOff defers even the
+    // first attempt by a microtask, so the call needs an await to happen
+    // and hang on the pending promise.
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Cross the batchSize threshold again while the first INSERT is pending.
+    for (let i = 0; i < writer.batchSize; i++) {
+      writer.addToQueue(TableName.Traces, { id: `b${i}`, name: "test" } as any);
+    }
+
+    expect(mockInsert).toHaveBeenCalledTimes(1);
+    expect(writer["queue"][TableName.Traces]).toHaveLength(100);
+
+    resolveFirstInsert();
+    await writer.shutdown();
+
+    expect(mockInsert).toHaveBeenCalledTimes(2);
+    expect(writer["queue"][TableName.Traces]).toHaveLength(0);
+  });
+
+  it("should drain a backlog in maxBatchSize-capped INSERTs", async () => {
+    const mockInsert = vi
+      .spyOn(clickhouseClientMock, "insert")
+      .mockResolvedValue();
+    writer["maxBatchSize"] = 250;
+
+    // Seed the queue directly so the full backlog is visible to the first
+    // splice instead of being consumed by addToQueue-triggered flushes.
+    for (let i = 0; i < 600; i++) {
+      writer["queue"][TableName.Traces].push({
+        createdAt: Date.now(),
+        attempts: 1,
+        data: { id: `${i}`, name: "test" },
+      });
+    }
+
+    await writer["flush"](TableName.Traces);
+
+    expect(mockInsert).toHaveBeenCalledTimes(3);
+    expect(mockInsert.mock.calls.map((call) => call[0].values.length)).toEqual([
+      250, 250, 100,
+    ]);
+    expect(writer["queue"][TableName.Traces]).toHaveLength(0);
+  });
+
+  it("should not lose rows below batchSize that arrive during a flush on shutdown", async () => {
+    let resolveFirstInsert!: () => void;
+    const firstInsert = new Promise<void>((resolve) => {
+      resolveFirstInsert = resolve;
+    });
+    const mockInsert = vi
+      .spyOn(clickhouseClientMock, "insert")
+      .mockReturnValueOnce(firstInsert)
+      .mockResolvedValueOnce();
+
+    // The first batchSize rows start a flush whose INSERT stays pending
+    // (backOff defers even the first attempt by a microtask).
+    for (let i = 0; i < writer.batchSize; i++) {
+      writer.addToQueue(TableName.Traces, { id: `a${i}`, name: "test" } as any);
+    }
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Rows below batchSize arriving while that flush is in flight trigger no
+    // new flush; shutdown must still write them out.
+    for (let i = 0; i < 80; i++) {
+      writer.addToQueue(TableName.Traces, { id: `b${i}`, name: "test" } as any);
+    }
+
+    resolveFirstInsert();
+    await writer.shutdown();
+
+    expect(mockInsert).toHaveBeenCalledTimes(2);
+    const writtenRows = mockInsert.mock.calls.reduce(
+      (total, call) => total + call[0].values.length,
+      0,
+    );
+    expect(writtenRows).toBe(180);
+    expect(writer["queue"][TableName.Traces]).toHaveLength(0);
+  });
+
+  it("should keep maxBatchSize at or above batchSize", () => {
+    expect(writer["maxBatchSize"]).toBeGreaterThanOrEqual(writer.batchSize);
+  });
+
+  it("should raise maxBatchSize to batchSize when the configured max is lower", async () => {
+    const envMock = vi.mocked(env);
+    const originalMax =
+      envMock.LANGFUSE_INGESTION_CLICKHOUSE_WRITE_MAX_BATCH_SIZE;
+    envMock.LANGFUSE_INGESTION_CLICKHOUSE_WRITE_MAX_BATCH_SIZE = 50;
+
+    ClickhouseWriter.instance = null;
+    try {
+      const constrainedWriter =
+        ClickhouseWriter.getInstance(clickhouseClientMock);
+
+      expect(constrainedWriter.batchSize).toBe(
+        env.LANGFUSE_INGESTION_CLICKHOUSE_WRITE_BATCH_SIZE,
+      );
+      expect(constrainedWriter["maxBatchSize"]).toBe(
+        constrainedWriter.batchSize,
+      );
+
+      await constrainedWriter.shutdown();
+    } finally {
+      envMock.LANGFUSE_INGESTION_CLICKHOUSE_WRITE_MAX_BATCH_SIZE = originalMax;
+      ClickhouseWriter.instance = writer;
+    }
   });
 
   it("should report wait time and processing time metrics correctly", async () => {

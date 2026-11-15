@@ -36,6 +36,12 @@ import {
   planScoreFilterPushdown,
   resolveScoreDataRequirement,
 } from "../queries/clickhouse-sql/score-filter-pushdown";
+import { env } from "../../env";
+import {
+  coalescedQueryClickhouse,
+  normalizeFilterForKey,
+  stableStringify,
+} from "../cache";
 
 export type TracesTableReturnType = Pick<
   TraceRecordReadType,
@@ -97,7 +103,9 @@ export const convertToUiTableRows = (
     id: row.id,
     projectId: row.project_id,
     timestamp: parseClickhouseUTCDateTimeFormat(row.timestamp),
-    tags: row.tags,
+    // Copy the array: coalesced callers share one underlying result row, and
+    // tags are the only array field consumers sort in place.
+    tags: row.tags ? [...row.tags] : row.tags,
     bookmarked: row.bookmarked,
     name: row.name ?? null,
     release: row.release ?? null,
@@ -216,6 +224,48 @@ async function getTracesTableGeneric(
 ): Promise<Array<SelectReturnTypeMap[keyof SelectReturnTypeMap]>>;
 
 async function getTracesTableGeneric(props: FetchTracesTableProps) {
+  // The coalescing key is built from the structured request inputs, not from
+  // the rendered SQL: every filter render generates fresh random parameter
+  // names, so two identical logical requests never render the same query
+  // text. Date values (filter time windows, deletion cursors) are normalized
+  // to ISO strings so distinct time windows cannot collide into one key.
+  // Telemetry tags do not influence the result and stay out of the key.
+  const key = stableStringify({
+    select: props.select,
+    projectId: props.projectId,
+    filter: normalizeFilterForKey(props.filter),
+    searchQuery: props.searchQuery ?? null,
+    searchType: props.searchType ? [...props.searchType].sort() : null,
+    orderBy: props.orderBy ?? null,
+    limit: props.limit ?? null,
+    page: props.page ?? null,
+    traceDeleteCursor: props.traceDeleteCursor
+      ? normalizeFilterForKey(props.traceDeleteCursor)
+      : null,
+    traceDeleteCursorOrder: props.traceDeleteCursorOrder ?? null,
+    clickhouseConfigs: props.clickhouseConfigs
+      ? normalizeFilterForKey(props.clickhouseConfigs)
+      : null,
+  });
+
+  // Count and metrics tolerate a short staleness window. Rows and
+  // identifiers must reflect the current table state (pagination, deletion
+  // batches), so they only share in-flight executions, never cached results.
+  const ttlMs =
+    props.select === "count" || props.select === "metrics"
+      ? env.LANGFUSE_UI_TABLE_QUERY_CACHE_TTL_MS
+      : 0;
+
+  return coalescedQueryClickhouse({
+    key,
+    ttlMs,
+    loader: () => loadTracesTableGeneric(props),
+  });
+}
+
+async function loadTracesTableGeneric(
+  props: FetchTracesTableProps,
+): Promise<Array<SelectReturnTypeMap[keyof SelectReturnTypeMap]>> {
   const {
     select,
     projectId,

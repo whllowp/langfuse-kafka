@@ -643,6 +643,14 @@ const EnvSchema = z.object({
   LANGFUSE_SKIP_FINAL_FOR_OTEL_PROJECTS: z
     .enum(["true", "false"])
     .default("false"),
+  // In-process TTL (ms) for caching identical traces UI table count/metrics
+  // query results. 0 disables the result cache; concurrent identical queries
+  // are still coalesced into a single in-flight execution.
+  LANGFUSE_UI_TABLE_QUERY_CACHE_TTL_MS: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .default(2000),
 
   // Langfuse AI Features
   LANGFUSE_AI_FEATURES_PUBLIC_KEY: z.string().optional(),

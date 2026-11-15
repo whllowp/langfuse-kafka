@@ -37,19 +37,25 @@ export class ClickhouseWriter {
   private static instance: ClickhouseWriter | null = null;
   private static client: ClickhouseClientType | null = null;
   batchSize: number;
+  maxBatchSize: number;
   writeInterval: number;
   maxAttempts: number;
   queue: ClickhouseQueue;
 
-  isIntervalFlushInProgress: boolean;
+  // At most one flush per table runs at any time. The promise of the running
+  // drain loop is stored here; see flush() for the handoff semantics.
+  private flushInFlight: Partial<Record<TableName, Promise<void>>> = {};
+
   intervalId: NodeJS.Timeout | null = null;
 
   private constructor() {
     this.batchSize = env.LANGFUSE_INGESTION_CLICKHOUSE_WRITE_BATCH_SIZE;
+    this.maxBatchSize = Math.max(
+      env.LANGFUSE_INGESTION_CLICKHOUSE_WRITE_MAX_BATCH_SIZE ?? this.batchSize,
+      this.batchSize,
+    );
     this.writeInterval = env.LANGFUSE_INGESTION_CLICKHOUSE_WRITE_INTERVAL_MS;
     this.maxAttempts = env.LANGFUSE_INGESTION_CLICKHOUSE_MAX_ATTEMPTS;
-
-    this.isIntervalFlushInProgress = false;
 
     this.queue = {
       [TableName.Traces]: [],
@@ -83,17 +89,14 @@ export class ClickhouseWriter {
 
   private start() {
     logger.info(
-      `Starting ClickhouseWriter. Max interval: ${this.writeInterval} ms, Max batch size: ${this.batchSize}`,
+      `Starting ClickhouseWriter. Max interval: ${this.writeInterval} ms, Batch size: ${this.batchSize}, Max batch size: ${this.maxBatchSize}`,
     );
 
+    // flushAll is re-entrant on every tick: per-table single flight inside
+    // flush() skips tables with an in-flight drain while the remaining
+    // tables flush normally.
     this.intervalId = setInterval(() => {
-      if (this.isIntervalFlushInProgress) return;
-
-      this.isIntervalFlushInProgress = true;
-
-      this.flushAll().finally(() => {
-        this.isIntervalFlushInProgress = false;
-      });
+      this.flushAll();
     }, this.writeInterval);
   }
 
@@ -360,214 +363,287 @@ export class ClickhouseWriter {
     return record;
   }
 
+  /**
+   * Flush a single table's queue. At most one flush per table runs at a
+   * time: a caller that finds an in-flight flush returns immediately and
+   * relies on that drain loop (or the next interval tick) to pick up the
+   * queue. fullQueue callers (shutdown) instead wait for the in-flight
+   * flush and then take over, so they resolve only once the table's queue
+   * is empty (rows written or requeued/dropped per their failure policy).
+   */
   private async flush<T extends TableName>(tableName: T, fullQueue = false) {
     const entityQueue = this.queue[tableName];
-    if (entityQueue.length === 0) return;
 
-    let queueItems = entityQueue.splice(
-      0,
-      fullQueue ? entityQueue.length : this.batchSize,
-    );
-
-    // Log wait time
-    queueItems.forEach((item) => {
-      const waitTime = Date.now() - item.createdAt;
-      recordHistogram("langfuse.queue.clickhouse_writer.wait_time", waitTime, {
-        unit: "milliseconds",
-      });
-      recordDistribution(
-        "langfuse.queue.clickhouse_writer.time_distribution",
-        waitTime,
-        {
-          entity_type: tableName,
-          type: "wait",
-          unit: "milliseconds",
-        },
-      );
-    });
-
-    const currentSpan = getCurrentSpan();
-    if (currentSpan) {
-      currentSpan.setAttributes({
-        [`${tableName}-length`]: queueItems.length,
-      });
+    while (true) {
+      const inFlight = this.flushInFlight[tableName];
+      if (!inFlight) break;
+      if (!fullQueue) return;
+      await inFlight.catch(() => {});
     }
 
+    if (entityQueue.length === 0) return;
+
+    // The placeholder is assigned before the first await of this call, so
+    // callers running in the same synchronous block observe the in-flight
+    // flush instead of starting a second drain.
+    const flushPromise = this.drainQueue(tableName, fullQueue);
+    this.flushInFlight[tableName] = flushPromise;
     try {
-      const processingStartTime = Date.now();
+      await flushPromise;
+    } finally {
+      if (this.flushInFlight[tableName] === flushPromise) {
+        delete this.flushInFlight[tableName];
+      }
+    }
+  }
 
-      let recordsToWrite = queueItems.map((item) => item.data);
-      recordsToWrite = recordsToWrite.map((r) =>
-        this.clampDecimal64Fields(tableName, r),
+  /**
+   * Write queued records until fewer than batchSize remain (or all rows
+   * queued when the drain started, in fullQueue mode), splicing at most
+   * maxBatchSize records per INSERT. A failed batch is requeued (or dropped
+   * once attempts are exhausted) and the loop stops; the next interval tick
+   * or addToQueue trigger picks the queue back up.
+   */
+  private async drainQueue<T extends TableName>(
+    tableName: T,
+    fullQueue: boolean,
+  ) {
+    const entityQueue = this.queue[tableName];
+
+    // fullQueue drains only the rows queued when it starts. Rows added
+    // while draining are left for the next interval tick or fullQueue
+    // caller, which keeps the loop finite even if inserts feed rows back
+    // into the queue.
+    let pendingRowCount = entityQueue.length;
+
+    while (true) {
+      let queueItems = entityQueue.splice(
+        0,
+        fullQueue
+          ? entityQueue.length
+          : Math.min(entityQueue.length, this.maxBatchSize),
       );
-      let hasBeenTruncated = false;
+      if (queueItems.length === 0) return;
+      pendingRowCount -= queueItems.length;
 
-      await backOff(
-        async () =>
-          this.writeToClickhouse({
-            table: tableName,
-            records: recordsToWrite,
-          }),
-        {
-          numOfAttempts: env.LANGFUSE_INGESTION_CLICKHOUSE_MAX_ATTEMPTS,
-          retry: (error: Error, attemptNumber: number) => {
-            const isRetryable = this.isRetryableError(error);
-            const isSizeError = this.isSizeError(error);
-            const isStringLengthError = this.isStringLengthError(error);
-
-            if (isRetryable) {
-              logger.warn(
-                `ClickHouse Writer failed with retryable error for ${tableName} (attempt ${attemptNumber}/${env.LANGFUSE_INGESTION_CLICKHOUSE_MAX_ATTEMPTS}): ${error.message}`,
-                {
-                  error: error.message,
-                  attemptNumber,
-                },
-              );
-              currentSpan?.addEvent("clickhouse-query-retry", {
-                "retry.attempt": attemptNumber,
-                "retry.error": error.message,
-              });
-              return true;
-            } else if (isStringLengthError) {
-              logger.warn(
-                `ClickHouse Writer failed with string length error for ${tableName} (attempt ${attemptNumber}/${env.LANGFUSE_INGESTION_CLICKHOUSE_MAX_ATTEMPTS}): Splitting batch and retrying`,
-                {
-                  error: error.message,
-                  attemptNumber,
-                  batchSize: queueItems.length,
-                },
-              );
-
-              const { retryItems, requeueItems } = this.handleStringLengthError(
-                tableName,
-                queueItems,
-              );
-
-              // Update records to write with only the retry items
-              recordsToWrite = retryItems.map((item) => item.data);
-              queueItems = retryItems;
-
-              // Prepend requeue items to the front of the queue to maintain order as much as possible with parallel execution.
-              if (requeueItems.length > 0) {
-                entityQueue.unshift(...requeueItems);
-              }
-
-              currentSpan?.addEvent("clickhouse-query-split-retry", {
-                "retry.attempt": attemptNumber,
-                "retry.error": error.message,
-                "split.retry_count": retryItems.length,
-                "split.requeue_count": requeueItems.length,
-              });
-              return true;
-            } else if (isSizeError && !hasBeenTruncated) {
-              logger.warn(
-                `ClickHouse Writer failed with size error for ${tableName} (attempt ${attemptNumber}/${env.LANGFUSE_INGESTION_CLICKHOUSE_MAX_ATTEMPTS}): Truncating oversized records and retrying`,
-                {
-                  error: error.message,
-                  attemptNumber,
-                },
-              );
-
-              // Truncate oversized records
-              recordsToWrite = recordsToWrite.map((record) =>
-                this.truncateOversizedRecord(tableName, record),
-              );
-              hasBeenTruncated = true;
-
-              currentSpan?.addEvent("clickhouse-query-truncate-retry", {
-                "retry.attempt": attemptNumber,
-                "retry.error": error.message,
-                truncated: true,
-              });
-              return true;
-            }
-
-            logger.error(
-              `ClickHouse query failed with non-retryable error: ${error.message}`,
-              {
-                error: error.message,
-              },
-            );
-            return false;
-          },
-          startingDelay: 100,
-          timeMultiple: 1,
-          maxDelay: 100,
-        },
-      );
-
-      // Log processing time
-      const processingTime = Date.now() - processingStartTime;
-
-      recordHistogram(
-        "langfuse.queue.clickhouse_writer.processing_time",
-        processingTime,
-        {
-          unit: "milliseconds",
-        },
-      );
-      recordDistribution(
-        "langfuse.queue.clickhouse_writer.time_distribution",
-        processingTime,
-        {
-          entity_type: tableName,
-          type: "processing",
-          unit: "milliseconds",
-        },
-      );
-
-      logger.debug(
-        `Flushed ${queueItems.length} records to Clickhouse ${tableName}. New queue length: ${entityQueue.length}`,
-      );
-
-      recordGauge(
-        "ingestion_clickhouse_insert_queue_length",
-        entityQueue.length,
-        {
-          unit: "records",
-          entityType: tableName,
-        },
-      );
-    } catch (err) {
-      logger.error(`ClickhouseWriter.flush ${tableName}`, err);
-
-      // Re-add the records to the queue with incremented attempts
-      let droppedCount = 0;
+      // Log wait time
       queueItems.forEach((item) => {
-        if (item.attempts < this.maxAttempts) {
-          entityQueue.push({
-            ...item,
-            attempts: item.attempts + 1,
-          });
-        } else {
-          // TODO - Add to a dead letter queue in Redis rather than dropping
-          recordIncrement("langfuse.queue.clickhouse_writer.error");
-          droppedCount++;
-        }
+        const waitTime = Date.now() - item.createdAt;
+        recordHistogram(
+          "langfuse.queue.clickhouse_writer.wait_time",
+          waitTime,
+          {
+            unit: "milliseconds",
+          },
+        );
+        recordDistribution(
+          "langfuse.queue.clickhouse_writer.time_distribution",
+          waitTime,
+          {
+            entity_type: tableName,
+            type: "wait",
+            unit: "milliseconds",
+          },
+        );
       });
 
-      if (droppedCount > 0) {
-        recordIncrement(
-          "langfuse.queue.clickhouse_writer.rows_dropped",
-          droppedCount,
-          { entity_type: tableName },
+      const currentSpan = getCurrentSpan();
+      if (currentSpan) {
+        currentSpan.setAttributes({
+          [`${tableName}-length`]: queueItems.length,
+        });
+      }
+
+      try {
+        const processingStartTime = Date.now();
+
+        let recordsToWrite = queueItems.map((item) => item.data);
+        recordsToWrite = recordsToWrite.map((r) =>
+          this.clampDecimal64Fields(tableName, r),
+        );
+        let hasBeenTruncated = false;
+
+        await backOff(
+          async () =>
+            this.writeToClickhouse({
+              table: tableName,
+              records: recordsToWrite,
+            }),
+          {
+            numOfAttempts: env.LANGFUSE_INGESTION_CLICKHOUSE_MAX_ATTEMPTS,
+            retry: (error: Error, attemptNumber: number) => {
+              const isRetryable = this.isRetryableError(error);
+              const isSizeError = this.isSizeError(error);
+              const isStringLengthError = this.isStringLengthError(error);
+
+              if (isRetryable) {
+                logger.warn(
+                  `ClickHouse Writer failed with retryable error for ${tableName} (attempt ${attemptNumber}/${env.LANGFUSE_INGESTION_CLICKHOUSE_MAX_ATTEMPTS}): ${error.message}`,
+                  {
+                    error: error.message,
+                    attemptNumber,
+                  },
+                );
+                currentSpan?.addEvent("clickhouse-query-retry", {
+                  "retry.attempt": attemptNumber,
+                  "retry.error": error.message,
+                });
+                return true;
+              } else if (
+                isStringLengthError ||
+                // A size error that survives truncation means the batch is
+                // too large as a whole (row count x volume), so split it
+                // instead of truncating single fields again.
+                (isSizeError && hasBeenTruncated)
+              ) {
+                logger.warn(
+                  `ClickHouse Writer failed with ${isStringLengthError ? "string length error" : "size error"} for ${tableName} (attempt ${attemptNumber}/${env.LANGFUSE_INGESTION_CLICKHOUSE_MAX_ATTEMPTS}): Splitting batch and retrying`,
+                  {
+                    error: error.message,
+                    attemptNumber,
+                    batchSize: queueItems.length,
+                  },
+                );
+
+                const { retryItems, requeueItems } =
+                  this.handleStringLengthError(tableName, queueItems);
+
+                // Update records to write with only the retry items
+                recordsToWrite = retryItems.map((item) => item.data);
+                queueItems = retryItems;
+
+                // Prepend requeue items to the front of the queue to maintain order as much as possible with parallel execution.
+                if (requeueItems.length > 0) {
+                  entityQueue.unshift(...requeueItems);
+                }
+
+                currentSpan?.addEvent("clickhouse-query-split-retry", {
+                  "retry.attempt": attemptNumber,
+                  "retry.error": error.message,
+                  "split.retry_count": retryItems.length,
+                  "split.requeue_count": requeueItems.length,
+                });
+                return true;
+              } else if (isSizeError && !hasBeenTruncated) {
+                logger.warn(
+                  `ClickHouse Writer failed with size error for ${tableName} (attempt ${attemptNumber}/${env.LANGFUSE_INGESTION_CLICKHOUSE_MAX_ATTEMPTS}): Truncating oversized records and retrying`,
+                  {
+                    error: error.message,
+                    attemptNumber,
+                  },
+                );
+
+                // Truncate oversized records
+                recordsToWrite = recordsToWrite.map((record) =>
+                  this.truncateOversizedRecord(tableName, record),
+                );
+                hasBeenTruncated = true;
+
+                currentSpan?.addEvent("clickhouse-query-truncate-retry", {
+                  "retry.attempt": attemptNumber,
+                  "retry.error": error.message,
+                  truncated: true,
+                });
+                return true;
+              }
+
+              logger.error(
+                `ClickHouse query failed with non-retryable error: ${error.message}`,
+                {
+                  error: error.message,
+                },
+              );
+              return false;
+            },
+            startingDelay: 100,
+            timeMultiple: 1,
+            maxDelay: 100,
+          },
         );
 
-        const droppedIds = queueItems
-          .filter((item) => item.attempts >= this.maxAttempts)
-          .map((item) => {
-            const r = item.data as Record<string, unknown>;
-            return {
-              project_id: r.project_id,
-              trace_id: r.trace_id ?? r.id,
-              id: r.id,
-            };
-          });
+        // Log processing time
+        const processingTime = Date.now() - processingStartTime;
 
-        logger.error(
-          `ClickhouseWriter: Max attempts reached, dropped ${droppedCount} ${tableName} record(s)`,
-          { droppedIds },
+        recordHistogram(
+          "langfuse.queue.clickhouse_writer.processing_time",
+          processingTime,
+          {
+            unit: "milliseconds",
+          },
         );
+        recordDistribution(
+          "langfuse.queue.clickhouse_writer.time_distribution",
+          processingTime,
+          {
+            entity_type: tableName,
+            type: "processing",
+            unit: "milliseconds",
+          },
+        );
+
+        logger.debug(
+          `Flushed ${queueItems.length} records to Clickhouse ${tableName}. New queue length: ${entityQueue.length}`,
+        );
+
+        recordGauge(
+          "ingestion_clickhouse_insert_queue_length",
+          entityQueue.length,
+          {
+            unit: "records",
+            entityType: tableName,
+          },
+        );
+      } catch (err) {
+        logger.error(`ClickhouseWriter.flush ${tableName}`, err);
+
+        // Re-add the records to the queue with incremented attempts
+        let droppedCount = 0;
+        queueItems.forEach((item) => {
+          if (item.attempts < this.maxAttempts) {
+            entityQueue.push({
+              ...item,
+              attempts: item.attempts + 1,
+            });
+          } else {
+            // TODO - Add to a dead letter queue in Redis rather than dropping
+            recordIncrement("langfuse.queue.clickhouse_writer.error");
+            droppedCount++;
+          }
+        });
+
+        if (droppedCount > 0) {
+          recordIncrement(
+            "langfuse.queue.clickhouse_writer.rows_dropped",
+            droppedCount,
+            { entity_type: tableName },
+          );
+
+          const droppedIds = queueItems
+            .filter((item) => item.attempts >= this.maxAttempts)
+            .map((item) => {
+              const r = item.data as Record<string, unknown>;
+              return {
+                project_id: r.project_id,
+                trace_id: r.trace_id ?? r.id,
+                id: r.id,
+              };
+            });
+
+          logger.error(
+            `ClickhouseWriter: Max attempts reached, dropped ${droppedCount} ${tableName} record(s)`,
+            { droppedIds },
+          );
+        }
+
+        // Stop draining so a persistently failing ClickHouse does not cause
+        // a busy retry loop; the next interval tick re-triggers the flush.
+        return;
+      }
+
+      if (
+        fullQueue ? pendingRowCount <= 0 : entityQueue.length < this.batchSize
+      ) {
+        return;
       }
     }
   }
@@ -583,7 +659,12 @@ export class ClickhouseWriter {
       data,
     });
 
-    if (entityQueue.length >= this.batchSize) {
+    // Skip the trigger while a flush is in flight: its drain loop takes the
+    // queued rows along in maxBatchSize-sized batches.
+    if (
+      entityQueue.length >= this.batchSize &&
+      !this.flushInFlight[tableName]
+    ) {
       logger.debug(`Queue is full. Flushing ${tableName}...`);
 
       this.flush(tableName).catch((err) => {
